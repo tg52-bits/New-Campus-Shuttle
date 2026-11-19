@@ -112,97 +112,283 @@ $$;
 
 -- When is the next bus at my stop? Running trips use live position and typical road speeds;
 -- trips that have not started use the schedule plus any delay their vehicle is already carrying.
-CREATE OR REPLACE FUNCTION public.app_next_arrivals(p_stop_id integer, p_limit integer DEFAULT 5)
-RETURNS TABLE (route_code varchar, route_name varchar, trip_id integer, vehicle_id integer,
-               eta timestamp, minutes_away numeric, basis text, delay_min numeric, stops_away integer)
+
+CREATE OR REPLACE FUNCTION public.app_next_arrivals(
+    p_stop_id integer,
+    p_limit integer DEFAULT 5
+)
+RETURNS TABLE (
+    route_code varchar,
+    route_name varchar,
+    trip_id integer,
+    vehicle_id integer,
+    eta timestamp,
+    minutes_away numeric,
+    basis text,
+    delay_min numeric,
+    stops_away integer
+)
 LANGUAGE sql STABLE AS $$
-    WITH n AS (SELECT public.app_now() AS t),
+    WITH n AS (
+        SELECT public.app_now() AS t
+    ),
     cand AS (
-        SELECT t.trip_id, t.route_id, t.vehicle_id, t.status, rs.distance_from_start_m AS stop_m,
-               e.scheduled_arrival, e.actual_arrival, e.actual_departure, lf.measure_m, lf.recorded_at AS fix_at
+        SELECT
+            t.trip_id,
+            t.route_id,
+            t.vehicle_id,
+            t.status,
+            rs.distance_from_start_m AS stop_m,
+            e.scheduled_arrival,
+            e.actual_arrival,
+            e.actual_departure,
+            lf.measure_m,
+            lf.recorded_at AS fix_at
         FROM public.trips t
-        JOIN public.route_stops rs ON rs.route_id = t.route_id AND rs.stop_id = p_stop_id
-        JOIN public.trip_stop_event e ON e.trip_id = t.trip_id AND e.stop_sequence = rs.stop_sequence
-        LEFT JOIN LATERAL (SELECT v.measure_m, v.recorded_at FROM public.vehicle_position v
-                           WHERE v.trip_id = t.trip_id AND v.measure_m IS NOT NULL
-                           ORDER BY v.recorded_at DESC LIMIT 1) lf ON true
+        JOIN public.route_stops rs
+          ON rs.route_id = t.route_id
+         AND rs.stop_id = p_stop_id
+        JOIN public.trip_stop_event e
+          ON e.trip_id = t.trip_id
+         AND e.stop_sequence = rs.stop_sequence
+        LEFT JOIN LATERAL (
+            SELECT v.measure_m, v.recorded_at
+            FROM public.vehicle_position v
+            WHERE v.trip_id = t.trip_id
+              AND v.measure_m IS NOT NULL
+            ORDER BY v.recorded_at DESC
+            LIMIT 1
+        ) lf ON true
         CROSS JOIN n
         WHERE t.status IN ('Scheduled', 'In Progress')
           AND t.scheduled_end >= n.t - interval '30 minutes'
-          AND t.scheduled_start <= n.t + make_interval(mins => public.param('eta_horizon_min')::int)
+          AND t.scheduled_start <=
+              n.t + make_interval(
+                  mins => public.param('eta_horizon_min')::int
+              )
           AND e.actual_departure IS NULL
-          -- a running trip that stopped reporting long ago is not predicted
-          AND NOT (t.status = 'In Progress' AND lf.recorded_at IS NOT NULL
-                   AND EXTRACT(EPOCH FROM (n.t - lf.recorded_at)) / public.app_speed() > public.param('lost_bus_s'))
+          AND NOT (
+              t.status = 'In Progress'
+              AND lf.recorded_at IS NOT NULL
+              AND EXTRACT(EPOCH FROM (n.t - lf.recorded_at))
+                  / public.app_speed() > public.param('lost_bus_s')
+          )
     ),
     est AS (
-        SELECT c.*,
-               CASE
-                 WHEN c.actual_arrival IS NOT NULL THEN c.actual_arrival
-                 WHEN c.status = 'In Progress' AND c.measure_m IS NOT NULL AND c.stop_m >= c.measure_m - public.param('geofence_radius_m')
-                      THEN greatest(c.fix_at + make_interval(secs => public.eta_seconds(c.route_id, c.measure_m, c.stop_m, n.t)::double precision), n.t)
-                 ELSE c.scheduled_arrival + make_interval(secs => greatest(coalesce((
-                          SELECT EXTRACT(EPOCH FROM (e2.actual_arrival - e2.scheduled_arrival))
-                          FROM public.trips t2 JOIN public.trip_stop_event e2 ON e2.trip_id = t2.trip_id
-                          WHERE t2.vehicle_id = c.vehicle_id AND t2.scheduled_start < (SELECT scheduled_start FROM public.trips WHERE trip_id = c.trip_id)
-                            AND t2.status IN ('In Progress', 'Completed') AND e2.actual_arrival IS NOT NULL
-                            AND t2.scheduled_end >= (SELECT scheduled_start FROM public.trips WHERE trip_id = c.trip_id) - interval '30 minutes'
-                          ORDER BY t2.scheduled_start DESC, e2.stop_sequence DESC LIMIT 1), 0), 0)::double precision)
-               END AS eta_ts,
-               CASE WHEN c.actual_arrival IS NOT NULL THEN 'at stop now'
-                    WHEN c.status = 'In Progress' AND c.measure_m IS NOT NULL AND c.stop_m >= c.measure_m - public.param('geofence_radius_m') THEN 'live'
-                    ELSE 'scheduled' END AS basis_txt
-        FROM cand c CROSS JOIN n
+        SELECT
+            c.*,
+
+            CASE
+                WHEN c.actual_arrival IS NOT NULL
+                    THEN c.actual_arrival
+
+                WHEN c.status = 'In Progress'
+                     AND c.measure_m IS NOT NULL
+                     AND c.stop_m >= c.measure_m - public.param('geofence_radius_m')
+                    THEN
+                        n.t + make_interval(
+                            secs => public.eta_seconds(
+                                c.route_id,
+                                c.measure_m,
+                                c.stop_m,
+                                n.t
+                            )::double precision
+                        )
+
+                ELSE
+                    c.scheduled_arrival
+                    + make_interval(
+                        secs => greatest(
+                            coalesce((
+                                SELECT EXTRACT(
+                                    EPOCH FROM (
+                                        e2.actual_arrival -
+                                        e2.scheduled_arrival
+                                    )
+                                )
+                                FROM public.trips t2
+                                JOIN public.trip_stop_event e2
+                                  ON e2.trip_id = t2.trip_id
+                                WHERE t2.vehicle_id = c.vehicle_id
+                                  AND t2.scheduled_start < (
+                                      SELECT scheduled_start
+                                      FROM public.trips
+                                      WHERE trip_id = c.trip_id
+                                  )
+                                  AND t2.status IN ('In Progress', 'Completed')
+                                  AND e2.actual_arrival IS NOT NULL
+                                  AND t2.scheduled_end >= (
+                                      SELECT scheduled_start
+                                      FROM public.trips
+                                      WHERE trip_id = c.trip_id
+                                  ) - interval '30 minutes'
+                                ORDER BY
+                                    t2.scheduled_start DESC,
+                                    e2.stop_sequence DESC
+                                LIMIT 1
+                            ), 0),
+                            0
+                        )::double precision
+                    )
+            END AS eta_ts,
+
+            CASE
+                WHEN c.actual_arrival IS NOT NULL
+                    THEN 'at stop now'
+
+                WHEN c.status = 'In Progress'
+                     AND c.measure_m IS NOT NULL
+                     AND c.stop_m >= c.measure_m - public.param('geofence_radius_m')
+                    THEN 'live'
+
+                ELSE 'scheduled'
+            END AS basis_txt
+
+        FROM cand c
+        CROSS JOIN n
     )
-    SELECT r.route_code, r.route_name, e.trip_id, e.vehicle_id, e.eta_ts,
-           round(greatest(EXTRACT(EPOCH FROM (e.eta_ts - n.t)), 0) / 60, 1),
-           e.basis_txt,
-           round(EXTRACT(EPOCH FROM (e.eta_ts - e.scheduled_arrival)) / 60, 1),
-           CASE WHEN e.basis_txt = 'live'
-                THEN (SELECT count(*)::int FROM public.route_stops x
-                      WHERE x.route_id = e.route_id AND x.distance_from_start_m > e.measure_m AND x.distance_from_start_m < e.stop_m)
-           END
-    FROM est e CROSS JOIN n
-    JOIN public.routes r ON r.route_id = e.route_id
+
+    SELECT
+        r.route_code,
+        r.route_name,
+        e.trip_id,
+        e.vehicle_id,
+        e.eta_ts,
+
+        round(
+            greatest(
+                EXTRACT(EPOCH FROM (e.eta_ts - n.t)),
+                0
+            ) / 60,
+            1
+        ),
+
+        e.basis_txt,
+
+        round(
+            EXTRACT(EPOCH FROM (
+                e.eta_ts - e.scheduled_arrival
+            )) / 60,
+            1
+        ),
+
+        CASE
+            WHEN e.basis_txt = 'live'
+            THEN (
+                SELECT count(*)::int
+                FROM public.route_stops x
+                WHERE x.route_id = e.route_id
+                  AND x.distance_from_start_m > e.measure_m
+                  AND x.distance_from_start_m < e.stop_m
+            )
+        END
+
+    FROM est e
+    CROSS JOIN n
+    JOIN public.routes r
+      ON r.route_id = e.route_id
+
     WHERE e.eta_ts >= n.t - interval '30 seconds'
-      AND e.eta_ts <= n.t + make_interval(mins => public.param('eta_horizon_min')::int)
+      AND e.eta_ts <=
+          n.t + make_interval(
+              mins => public.param('eta_horizon_min')::int
+          )
+
     ORDER BY e.eta_ts
-    LIMIT p_limit
+    LIMIT p_limit;
 $$;
 
+
 -- One trip stop by stop: visited (with the delay), at the stop now, or upcoming (with an estimate).
+
 CREATE OR REPLACE FUNCTION public.app_trip_timeline(p_trip_id integer)
-RETURNS TABLE (stop_sequence integer, stop_name varchar, state text,
-               scheduled_arrival timestamp, actual_or_estimated timestamp, delay_min numeric)
+RETURNS TABLE (
+    stop_sequence integer,
+    stop_name varchar,
+    state text,
+    scheduled_arrival timestamp,
+    actual_or_estimated timestamp,
+    delay_min numeric
+)
 LANGUAGE sql STABLE AS $$
-    WITH t AS (SELECT tr.route_id, tr.status FROM public.trips tr WHERE tr.trip_id = p_trip_id),
-         lf AS (SELECT v.measure_m, v.recorded_at FROM public.vehicle_position v
-                WHERE v.trip_id = p_trip_id AND v.measure_m IS NOT NULL ORDER BY v.recorded_at DESC LIMIT 1)
-    SELECT e.stop_sequence, s.stop_name,
-           CASE WHEN e.actual_departure IS NOT NULL THEN 'visited'
+    WITH
+    t AS (
+        SELECT tr.route_id, tr.status
+        FROM public.trips tr
+        WHERE tr.trip_id = p_trip_id
+    ),
+    n AS (
+        SELECT public.app_now() AS now_ts
+    ),
+    lf AS (
+        SELECT v.measure_m, v.recorded_at
+        FROM public.vehicle_position v
+        WHERE v.trip_id = p_trip_id
+          AND v.measure_m IS NOT NULL
+        ORDER BY v.recorded_at DESC
+        LIMIT 1
+    ),
+    estimates AS (
+        SELECT
+            e.stop_sequence,
+            s.stop_name,
+
+            CASE
+                WHEN e.actual_departure IS NOT NULL THEN 'visited'
                 WHEN e.actual_arrival IS NOT NULL THEN 'at stop'
-                ELSE 'upcoming' END,
-           e.scheduled_arrival,
-           CASE WHEN e.actual_arrival IS NOT NULL THEN e.actual_arrival
-                WHEN lf.measure_m IS NOT NULL AND rs.distance_from_start_m >= lf.measure_m - public.param('geofence_radius_m')
-                     THEN greatest(lf.recorded_at + make_interval(secs =>
-                          public.eta_seconds(t.route_id, lf.measure_m, rs.distance_from_start_m, public.app_now())::double precision),
-                          public.app_now())
-                ELSE e.scheduled_arrival END,
-           round(EXTRACT(EPOCH FROM (
-               CASE WHEN e.actual_arrival IS NOT NULL THEN e.actual_arrival
-                    WHEN lf.measure_m IS NOT NULL AND rs.distance_from_start_m >= lf.measure_m - public.param('geofence_radius_m')
-                         THEN greatest(lf.recorded_at + make_interval(secs =>
-                              public.eta_seconds(t.route_id, lf.measure_m, rs.distance_from_start_m, public.app_now())::double precision),
-                              public.app_now())
-                    ELSE e.scheduled_arrival END - e.scheduled_arrival)) / 60, 1)
-    FROM t
-    JOIN public.trip_stop_event e ON e.trip_id = p_trip_id
-    JOIN public.stops s ON s.stop_id = e.stop_id
-    JOIN public.route_stops rs ON rs.route_id = t.route_id AND rs.stop_sequence = e.stop_sequence
-    LEFT JOIN lf ON true
-    ORDER BY e.stop_sequence
+                ELSE 'upcoming'
+            END AS stop_state,
+
+            e.scheduled_arrival,
+
+            CASE
+                WHEN e.actual_arrival IS NOT NULL
+                    THEN e.actual_arrival
+
+                WHEN lf.measure_m IS NOT NULL
+                     AND rs.distance_from_start_m >=
+                         lf.measure_m - public.param('geofence_radius_m')
+                    THEN
+                        n.now_ts + make_interval(
+                            secs => public.eta_seconds(
+                                t.route_id,
+                                lf.measure_m,
+                                rs.distance_from_start_m,
+                                n.now_ts
+                            )::double precision
+                        )
+
+                ELSE e.scheduled_arrival
+            END AS estimated_ts
+
+        FROM t
+        CROSS JOIN n
+        JOIN public.trip_stop_event e
+          ON e.trip_id = p_trip_id
+        JOIN public.stops s
+          ON s.stop_id = e.stop_id
+        JOIN public.route_stops rs
+          ON rs.route_id = t.route_id
+         AND rs.stop_sequence = e.stop_sequence
+        LEFT JOIN lf ON true
+    )
+
+    SELECT
+        stop_sequence,
+        stop_name,
+        stop_state,
+        scheduled_arrival,
+        estimated_ts,
+        round(
+            EXTRACT(EPOCH FROM (
+                estimated_ts - scheduled_arrival
+            )) / 60,
+            1
+        )
+    FROM estimates
+    ORDER BY stop_sequence;
 $$;
+
 
 -- Stops near a point (a rider's location), nearest first, with the routes that serve each.
 CREATE OR REPLACE FUNCTION public.app_stops_near(p_lon double precision, p_lat double precision,
